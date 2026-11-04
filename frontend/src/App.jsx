@@ -1518,7 +1518,7 @@ export default function App() {
           {/* Footer Note */}
           <footer className="mt-10 pt-4 border-t border-slate-200/80 flex flex-wrap items-center justify-between gap-2 text-sm text-slate-500">
             <span>
-              銀齡金融翻譯官｜國立高雄科技大學 智慧商務系 智慧金融應用專題（王詠筑、林瑋智、黃鼎軒、李宇辰）
+              銀齡金融翻譯官｜高齡者金融文件 AI 導讀與行動指引服務
             </span>
             <span className="font-medium text-[#0f5c5c]">
               ● 後端 Python FastAPI 服務已連線（內建真實 Tesseract 繁中 OCR、個資遮罩與防詐比對）
