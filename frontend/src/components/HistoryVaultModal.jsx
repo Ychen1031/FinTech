@@ -12,13 +12,16 @@ import {
   ChevronDown,
   ChevronUp,
   UploadCloud,
-  Sparkles
+  Sparkles,
+  Database,
+  Edit3
 } from 'lucide-react';
 
 export default function HistoryVaultView({
   historyData,
   apiBase,
   onOpenRecordInStep3,
+  onEditRecord,
   onDeleteRecord,
   onClearAll,
   onUploadNewClick
@@ -26,8 +29,10 @@ export default function HistoryVaultView({
   const [filterType, setFilterType] = useState('all'); // 'all' | 'upload' | 'scam' | 'normal'
   const [searchQuery, setSearchQuery] = useState('');
   const [expandedId, setExpandedId] = useState(null);
+  const [showDbSchema, setShowDbSchema] = useState(true);
 
   const records = historyData?.records || [];
+  const dbStats = historyData?.db_stats;
 
   const filteredRecords = records.filter((rec) => {
     if (filterType === 'upload' && rec.source_type !== 'upload') return false;
@@ -51,17 +56,28 @@ export default function HistoryVaultView({
       {/* Header & Export Actions */}
       <div className="flex flex-wrap items-center justify-between gap-4">
         <div>
-          <p className="text-sm font-medium text-slate-500 mb-1">我的文件 / 辨識結果收集庫</p>
+          <p className="text-sm font-medium text-slate-500 mb-1">
+            我的文件 / SQLite 結構化資料庫 (`silver_finance.db`)
+          </p>
           <h1 className="text-3xl md:text-4xl font-extrabold text-slate-900 flex items-center gap-3">
             <FolderKanban className="h-9 w-9 text-[#0f5c5c]" />
             <span>已收集的辨識結果（共 {historyData?.total || 0} 筆）</span>
           </h1>
           <p className="mt-1 text-base text-slate-600">
-            系統會自動保存每一次上傳照片或測試範例的辨識結果，方便您隨時回顧、比對或匯出報表。
+            所有辨識結果、家屬名單與防詐推播紀錄皆即時寫入後端 SQLite 關聯式資料庫，支援 SQL 統計查詢與報表匯出。
           </p>
         </div>
 
         <div className="flex flex-wrap items-center gap-2.5">
+          <button
+            type="button"
+            onClick={() => setShowDbSchema(!showDbSchema)}
+            className="flex items-center gap-1.5 rounded-xl border border-teal-300 bg-[#e9f2f0] px-4 py-2.5 text-sm font-bold text-[#16383a] hover:bg-teal-100 transition"
+          >
+            <Database className="h-4 w-4 text-[#0f5c5c]" />
+            {showDbSchema ? '收起 SQLite 資料表狀態' : '檢視 SQLite 資料表狀態'}
+          </button>
+
           <a
             href={`${apiBase}/api/history/export/csv`}
             download="銀齡金融翻譯官_辨識結果彙整.csv"
@@ -84,7 +100,7 @@ export default function HistoryVaultView({
             <button
               type="button"
               onClick={() => {
-                if (window.confirm('確定要清空所有已收集的辨識紀錄嗎？')) {
+                if (window.confirm('確定要清空 SQLite 中的所有辨識紀錄嗎？')) {
                   onClearAll();
                 }
               }}
@@ -96,6 +112,54 @@ export default function HistoryVaultView({
           )}
         </div>
       </div>
+
+      {/* SQLite Database Tables & Category Breakdown Banner */}
+      {showDbSchema && dbStats && (
+        <div className="rounded-3xl bg-[#16383a] p-5 text-white shadow-sm space-y-4">
+          <div className="flex flex-wrap items-center justify-between gap-2 border-b border-teal-800 pb-3">
+            <div className="flex items-center gap-2.5">
+              <Database className="h-5 w-5 text-emerald-300" />
+              <span className="font-extrabold text-base">
+                SQLite 關聯式資料庫即時狀態（`{dbStats.db_file}`｜檔案大小：{dbStats.db_size_kb} KB）
+              </span>
+            </div>
+            <span className="rounded-full bg-emerald-500/20 px-3 py-0.5 text-xs font-bold text-emerald-200 border border-emerald-400/30">
+              ● SQLite3 連線正常
+            </span>
+          </div>
+
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
+            {(dbStats.tables || []).map((tb) => (
+              <div
+                key={tb.table_name}
+                className="rounded-2xl bg-[#20494c] p-3.5 border border-teal-700/60"
+              >
+                <div className="flex items-center justify-between">
+                  <code className="text-xs font-extrabold text-amber-300">{tb.table_name}</code>
+                  <span className="rounded-md bg-teal-950/80 px-2 py-0.5 text-xs font-bold text-emerald-300">
+                    {tb.row_count} 筆資料
+                  </span>
+                </div>
+                <p className="mt-1.5 text-xs text-teal-100/85">{tb.description}</p>
+              </div>
+            ))}
+          </div>
+
+          {dbStats.category_breakdown?.length > 0 && (
+            <div className="flex flex-wrap items-center gap-2 pt-1 text-xs">
+              <span className="font-bold text-teal-200">SQL 分類統計 (`GROUP BY doc_category`)：</span>
+              {dbStats.category_breakdown.map((c) => (
+                <span
+                  key={c.category}
+                  className="rounded-lg bg-white/10 px-2.5 py-1 font-bold text-white"
+                >
+                  {c.category}：{c.count} 筆
+                </span>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Summary Filter Pills & Search Bar */}
       <div className="flex flex-wrap items-center justify-between gap-4 rounded-2xl bg-white p-4 shadow-sm border border-slate-200">
@@ -168,9 +232,9 @@ export default function HistoryVaultView({
           <div className="mx-auto flex h-16 w-16 items-center justify-center rounded-2xl bg-[#e9f2f0] text-[#0f5c5c]">
             <FileText className="h-8 w-8" />
           </div>
-          <h3 className="text-xl font-bold text-slate-800">目前尚無符合條件的辨識紀錄</h3>
+          <h3 className="text-xl font-bold text-slate-800">目前 SQLite 尚無符合條件的辨識紀錄</h3>
           <p className="text-sm text-slate-500 max-w-md mx-auto">
-            只要您上傳任何銀行通知 JPG 照片或點選範例文件進行辨識，系統就會自動將結果收集在這裡！
+            只要您上傳任何銀行通知 JPG 照片或點選範例文件進行辨識，系統就會自動將結構化資料寫入 SQLite `recognition_records` 資料表！
           </p>
           <button
             type="button"
@@ -196,7 +260,6 @@ export default function HistoryVaultView({
                     : 'border-slate-200 hover:border-[#0f5c5c]'
                 }`}
               >
-                {/* Card Main Row */}
                 <div className="p-6 flex flex-col md:flex-row gap-6 items-start">
                   {/* Left Thumbnail */}
                   <div
@@ -271,7 +334,6 @@ export default function HistoryVaultView({
                       </span>
                     </div>
 
-                    {/* Action Bar */}
                     <div className="pt-3 flex flex-wrap items-center justify-between gap-3 border-t border-slate-100">
                       <div className="flex flex-wrap items-center gap-2">
                         <button
@@ -281,6 +343,15 @@ export default function HistoryVaultView({
                         >
                           <Eye className="h-4 w-4" />
                           開啟完整導讀與語音畫面
+                        </button>
+
+                        <button
+                          type="button"
+                          onClick={() => onEditRecord && onEditRecord(rec)}
+                          className="flex items-center gap-1.5 rounded-xl border border-amber-300 bg-amber-50 px-4 py-2 text-sm font-bold text-amber-950 hover:bg-amber-100 transition"
+                        >
+                          <Edit3 className="h-4 w-4 text-amber-700" />
+                          修正辨識結果
                         </button>
 
                         <button
@@ -314,12 +385,11 @@ export default function HistoryVaultView({
                   </div>
                 </div>
 
-                {/* Expanded Detail Drawer: 5 Questions + Checklist + Raw OCR */}
                 {isExpanded && (
                   <div className="border-t border-slate-200 bg-slate-50/80 p-6 grid grid-cols-1 gap-6 lg:grid-cols-12">
                     <div className="lg:col-span-7 space-y-3">
                       <h4 className="text-sm font-extrabold text-[#16383a] uppercase tracking-wider">
-                        固定五題白話導讀紀錄
+                        固定五題白話導讀紀錄（SQLite 欄位：`q1_what_is_it` ~ `q5_important_notes`）
                       </h4>
                       <div className="rounded-2xl bg-white p-4 border border-slate-200 divide-y divide-slate-100 text-sm">
                         <div className="py-2 grid grid-cols-1 sm:grid-cols-12 gap-1">
@@ -347,7 +417,7 @@ export default function HistoryVaultView({
 
                     <div className="lg:col-span-5 space-y-3">
                       <h4 className="text-sm font-extrabold text-[#16383a] uppercase tracking-wider">
-                        照片 OCR 辨識出的原文內容（已遮罩個資）
+                        照片 OCR 辨識出的原文內容（SQLite 欄位：`masked_ocr_text`）
                       </h4>
                       <div className="rounded-2xl bg-white p-4 border border-slate-200 text-xs text-slate-700 font-mono whitespace-pre-wrap max-h-56 overflow-y-auto">
                         {rec.masked_ocr_text || rec.raw_ocr_text || '（無文字紀錄）'}

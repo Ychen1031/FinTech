@@ -1,79 +1,90 @@
 """
-模組四：語音朗讀與家屬守護網 (Family Guardian & Notification System)
-負責：
-1. 管理事先指定的家屬或社區關懷據點社工名單
-2. 遇到高風險／疑似詐騙文件時，自動即時推播警報給家屬（「鐵三角防護：長輩操作、AI解讀、家人把關」）
-3. 一般文件提供長輩「分享給家人」一鍵傳送導讀摘要與應備清單
-4. 支援家屬端即時回覆確認訊息，讓長輩在畫面上直接看到家人的安心叮嚀
+模組四：語音朗讀與家屬守護網 — SQLite 資料庫版 (family_guardian.py)
+所有家屬／社工守護名單與推播回覆紀錄直接儲存於 SQLite：
+- `family_guardians` 資料表
+- `family_notifications` 資料表
 """
 
+import json
+import uuid
 from datetime import datetime
 from typing import List, Dict, Any, Optional
-import uuid
+from database import get_db_connection, init_db
 
 
 class FamilyGuardianStore:
     def __init__(self):
-        self.guardians: List[Dict[str, Any]] = [
-            {
-                "id": "g_son",
-                "name": "王小明",
-                "relation": "長子（緊急聯絡人）",
-                "phone": "0912-345-678",
-                "line_bound": True,
-                "auto_notify_scam": True
-            },
-            {
-                "id": "g_daughter",
-                "name": "王雅婷",
-                "relation": "女兒（同住／鄰近家屬）",
-                "phone": "0928-888-168",
-                "line_bound": True,
-                "auto_notify_scam": True
-            },
-            {
-                "id": "g_social_worker",
-                "name": "陳淑芬 社工師",
-                "relation": "楠梓社區關懷據點",
-                "phone": "07-361-5111",
-                "line_bound": True,
-                "auto_notify_scam": False
-            }
-        ]
+        init_db()
 
-        self.notifications: List[Dict[str, Any]] = [
-            {
-                "id": "notif_init_1",
-                "timestamp": "今日 10:15",
-                "doc_title": "客戶審查權益通知",
-                "doc_category": "銀行通知",
-                "alert_type": "family_share",
-                "is_scam": False,
-                "summary": "銀行請長輩於 60 天內更新客戶基本資料，需準備確認書與身分證。",
-                "recipients": ["王小明（長子）", "王雅婷（女兒）"],
-                "status": "已由家屬確認回覆",
-                "family_reply": {
-                    "sender": "王小明（長子）",
-                    "time": "今日 10:22",
-                    "message": "爸，這張是銀行例行的資料更新通知，這禮拜五早上有空我載您去分行辦，身分證先放家裡收好喔！"
-                }
+    def _notif_row_to_dict(self, row) -> Dict[str, Any]:
+        reply = None
+        if row["reply_message"]:
+            reply = {
+                "sender": row["reply_sender"] or "家屬",
+                "time": row["reply_time"] or "",
+                "message": row["reply_message"]
             }
-        ]
+        return {
+            "id": row["id"],
+            "timestamp": row["timestamp"],
+            "doc_title": row["doc_title"],
+            "doc_category": row["doc_category"],
+            "alert_type": row["alert_type"],
+            "is_scam": bool(row["is_scam"]),
+            "summary": row["summary"] or "",
+            "suspicious_demands": json.loads(row["suspicious_demands_json"] or "[]"),
+            "custom_note": row["custom_note"] or "",
+            "recipients": json.loads(row["recipients_json"] or "[]"),
+            "status": row["status"],
+            "family_reply": reply
+        }
 
     def get_guardians(self) -> List[Dict[str, Any]]:
-        return self.guardians
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM family_guardians ORDER BY rowid ASC")
+        rows = cur.fetchall()
+        conn.close()
+        return [
+            {
+                "id": r["id"],
+                "name": r["name"],
+                "relation": r["relation"],
+                "phone": r["phone"],
+                "line_bound": bool(r["line_bound"]),
+                "auto_notify_scam": bool(r["auto_notify_scam"])
+            }
+            for r in rows
+        ]
+
+    @property
+    def notifications(self) -> List[Dict[str, Any]]:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM family_notifications ORDER BY rowid DESC")
+        rows = cur.fetchall()
+        conn.close()
+        return [self._notif_row_to_dict(r) for r in rows]
 
     def add_guardian(self, name: str, relation: str, phone: str, auto_notify_scam: bool = True) -> Dict[str, Any]:
-        new_g = {
-            "id": f"g_{uuid.uuid4().hex[:6]}",
+        gid = f"g_{uuid.uuid4().hex[:6]}"
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO family_guardians (id, name, relation, phone, line_bound, auto_notify_scam, created_at)
+            VALUES (?, ?, ?, ?, 1, ?, ?)
+        """, (gid, name, relation, phone, 1 if auto_notify_scam else 0, now_str))
+        conn.commit()
+        conn.close()
+        return {
+            "id": gid,
             "name": name,
             "relation": relation,
             "phone": phone,
             "line_bound": True,
             "auto_notify_scam": auto_notify_scam
         }
-        self.guardians.append(new_g)
-        return new_g
 
     def send_notification(
         self,
@@ -85,49 +96,69 @@ class FamilyGuardianStore:
         suspicious_demands: Optional[List[str]] = None,
         custom_note: str = ""
     ) -> Dict[str, Any]:
-        now_str = datetime.now().strftime("今日 %H:%M")
+        now_time = datetime.now().strftime("今日 %H:%M")
+        created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        guardians = self.get_guardians()
+
         recipients = [
             f"{g['name']}（{g['relation'].split('（')[0]}）"
-            for g in self.guardians
+            for g in guardians
             if (is_scam and g.get("auto_notify_scam")) or not is_scam
         ]
-        if not recipients and self.guardians:
-            recipients = [f"{self.guardians[0]['name']}（{self.guardians[0]['relation']}）"]
+        if not recipients and guardians:
+            recipients = [f"{guardians[0]['name']}（{guardians[0]['relation']}）"]
 
-        default_reply = None
-        status = "已推播至家屬 LINE 與守護端"
-        if is_scam:
-            status = "高風險警報已即時推播家屬"
+        status = "高風險警報已即時推播家屬" if is_scam else "已推播至家屬 LINE 與守護端"
+        notif_id = f"notif_{uuid.uuid4().hex[:8]}"
+        effective_alert_type = "scam_emergency" if is_scam else alert_type
 
-        notif = {
-            "id": f"notif_{uuid.uuid4().hex[:8]}",
-            "timestamp": now_str,
-            "doc_title": doc_title,
-            "doc_category": doc_category,
-            "alert_type": "scam_emergency" if is_scam else alert_type,
-            "is_scam": is_scam,
-            "summary": summary,
-            "suspicious_demands": suspicious_demands or [],
-            "custom_note": custom_note,
-            "recipients": recipients,
-            "status": status,
-            "family_reply": default_reply
-        }
-        self.notifications.insert(0, notif)
-        return notif
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO family_notifications (
+                id, timestamp, doc_title, doc_category, alert_type, is_scam,
+                summary, suspicious_demands_json, custom_note, recipients_json,
+                status, reply_sender, reply_time, reply_message, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?)
+        """, (
+            notif_id,
+            now_time,
+            doc_title,
+            doc_category,
+            effective_alert_type,
+            1 if is_scam else 0,
+            summary,
+            json.dumps(suspicious_demands or [], ensure_ascii=False),
+            custom_note,
+            json.dumps(recipients, ensure_ascii=False),
+            status,
+            created_at
+        ))
+        conn.commit()
+
+        cur.execute("SELECT * FROM family_notifications WHERE id = ?", (notif_id,))
+        row = cur.fetchone()
+        conn.close()
+        return self._notif_row_to_dict(row)
 
     def reply_to_notification(self, notif_id: str, sender: str, message: str) -> Optional[Dict[str, Any]]:
-        now_str = datetime.now().strftime("今日 %H:%M")
-        for n in self.notifications:
-            if n["id"] == notif_id:
-                n["status"] = "已由家屬確認回覆"
-                n["family_reply"] = {
-                    "sender": sender,
-                    "time": now_str,
-                    "message": message
-                }
-                return n
-        return None
+        now_time = datetime.now().strftime("今日 %H:%M")
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE family_notifications
+            SET status = '已由家屬確認回覆',
+                reply_sender = ?,
+                reply_time = ?,
+                reply_message = ?
+            WHERE id = ?
+        """, (sender, now_time, message, notif_id))
+        conn.commit()
+
+        cur.execute("SELECT * FROM family_notifications WHERE id = ?", (notif_id,))
+        row = cur.fetchone()
+        conn.close()
+        return self._notif_row_to_dict(row) if row else None
 
 
 guardian_store = FamilyGuardianStore()

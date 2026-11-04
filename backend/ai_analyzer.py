@@ -1,9 +1,9 @@
 """
-模組二：AI 解析與白話導讀 (VLM + Real Tesseract OCR + LLM Plain-Language Translator)
+模組二：AI 解析與白話導讀 (Gemini VLM + OpenAI ChatGPT GPT-4o Vision + Real OCR + Plain-Language Translator)
 負責：
 1. 接收經「個資遮罩」處理後的影像（確保敏感資料不直接交給雲端模型）
-2. 支援針對使用者上傳之任意 JPG/PNG 照片執行真實繁體中文 OCR (Tesseract chi_tra+eng)
-3. 支援串接 Google Gemini VLM API 或使用本地智慧金融文件解析引擎
+2. 支援針對使用者上傳之任意 JPG/PNG 照片執行真實繁體中文多通道 OCR + 金融詞典糾錯
+3. 支援串接 Google Gemini VLM (`gemini-2.5-flash`) 與 OpenAI ChatGPT Vision (`gpt-4o`) 多模態視覺模型
 4. 固定輸出「五題白話格式」、「辦理步驟」、「出門前應備資料檢查清單」與「國語／台語朗讀講稿」
 """
 
@@ -14,7 +14,7 @@ from typing import Dict, Any, Optional
 from sample_generator import SAMPLE_DOCUMENTS
 from scam_detector import analyze_scam_risk
 from image_processor import mask_sensitive_text
-from ocr_engine import extract_ocr_from_image_bytes, parse_ocr_text_to_structured_guide
+from ocr_engine import extract_ocr_from_image_bytes, parse_ocr_text_to_structured_guide, build_smart_highlights
 
 
 SYSTEM_PROMPT = """你是一位專為台灣高齡長輩服務的「銀齡金融翻譯官」。
@@ -55,13 +55,12 @@ async def call_gemini_vlm(
     masked_image_b64: str,
     api_key: str,
     ocr_hint: str = "",
-    model_name: str = "gemini-2.5-flash"
+    model_name: str = "gemini-3.5-flash-lite"
 ) -> Optional[Dict[str, Any]]:
     """
     使用 Google Gemini 多模態模型解析遮罩後的金融文件影像
     """
     clean_b64 = masked_image_b64.split(",")[-1] if "," in masked_image_b64 else masked_image_b64
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
 
     prompt_text = SYSTEM_PROMPT
     if ocr_hint:
@@ -87,16 +86,81 @@ async def call_gemini_vlm(
         }
     }
 
+    models_to_try = [
+        model_name,
+        "gemini-3.5-flash",
+        "gemini-3.5-pro",
+        "gemini-2.5-flash-lite",
+        "gemini-2.5-flash"
+    ]
+
     async with httpx.AsyncClient(timeout=25.0) as client:
-        resp = await client.post(url, json=payload)
+        for m in models_to_try:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent?key={api_key}"
+            resp = await client.post(url, json=payload)
+            if resp.status_code == 200:
+                data = resp.json()
+                candidates = data.get("candidates", [])
+                if not candidates:
+                    continue
+                text_out = candidates[0].get("content", {}).get("parts", [{}])[0].get("text", "")
+                text_out = text_out.strip()
+                if text_out.startswith("```"):
+                    text_out = text_out.strip("`").removeprefix("json").strip()
+                return json.loads(text_out)
+    return None
+
+
+async def call_openai_vlm(
+    masked_image_b64: str,
+    api_key: str,
+    ocr_hint: str = "",
+    model_name: str = "gpt-4o"
+) -> Optional[Dict[str, Any]]:
+    """
+    使用 OpenAI ChatGPT (GPT-4o Vision) 多模態視覺模型解析遮罩後的金融文件影像
+    """
+    clean_b64 = masked_image_b64.split(",")[-1] if "," in masked_image_b64 else masked_image_b64
+    url = "https://api.openai.com/v1/chat/completions"
+
+    prompt_text = SYSTEM_PROMPT
+    if ocr_hint:
+        prompt_text += f"\n\n以下為系統初步 OCR 辨識出的文字供參考：\n{ocr_hint}"
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json"
+    }
+
+    payload = {
+        "model": model_name,
+        "temperature": 0.2,
+        "response_format": {"type": "json_object"},
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt_text},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/jpeg;base64,{clean_b64}"
+                        }
+                    }
+                ]
+            }
+        ]
+    }
+
+    async with httpx.AsyncClient(timeout=25.0) as client:
+        resp = await client.post(url, headers=headers, json=payload)
         if resp.status_code != 200:
             return None
         data = resp.json()
-        candidates = data.get("candidates", [])
-        if not candidates:
+        choices = data.get("choices", [])
+        if not choices:
             return None
-        text_out = candidates[0].get("content", {}).get("parts", [{}])[0].get("text", "")
-        text_out = text_out.strip()
+        text_out = choices[0].get("message", {}).get("content", "").strip()
         if text_out.startswith("```"):
             text_out = text_out.strip("`").removeprefix("json").strip()
         return json.loads(text_out)
@@ -108,53 +172,77 @@ async def analyze_financial_document(
     filename: str = "",
     preset_id: str = "",
     custom_text_hint: str = "",
-    api_key: Optional[str] = None
+    api_key: Optional[str] = None,
+    client_vlm_result: Optional[Dict[str, Any]] = None,
+    client_vlm_mode: str = ""
 ) -> Dict[str, Any]:
     """
     執行完整 AI 文件解析、真實影像 OCR 文字擷取、個資遮罩與防詐規則比對
+    支援自動根據 API Key 判斷呼叫 OpenAI ChatGPT (`sk-...`) 或 Google Gemini (`AIza...`)
     """
-    effective_api_key = (api_key or os.environ.get("GEMINI_API_KEY") or "").strip()
+    effective_api_key = (
+        api_key
+        or os.environ.get("OPENAI_API_KEY")
+        or os.environ.get("GEMINI_API_KEY")
+        or ""
+    ).strip()
     ai_result = None
     used_mode = "builtin_smart_engine"
     extracted_ocr_text = ""
 
-    # 1. 若為使用者實際上傳的照片（無 preset_id），先執行真實 Tesseract 繁體中文 OCR！
+    # 1. 若為使用者實際上傳的照片（無 preset_id），先執行真實多通道繁體中文 OCR！
     if not preset_id and image_bytes:
         extracted_ocr_text = extract_ocr_from_image_bytes(image_bytes)
         used_mode = "real_tesseract_ocr_engine"
 
-    # 2. 若有提供 Gemini API Key 且非單純點擊內建範例，可呼叫雲端多模態模型
-    if effective_api_key and not preset_id:
+    # 2. 若前端瀏覽器已直接完成 OpenAI / Gemini 雲端視覺模型解析，直接使用該結果
+    if client_vlm_result and isinstance(client_vlm_result, dict) and client_vlm_result.get("doc_title"):
+        ai_result = client_vlm_result
+        used_mode = client_vlm_mode or (
+            "openai_chatgpt_vlm" if effective_api_key.startswith("sk-") else "gemini_vlm_plus_ocr"
+        )
+
+    # 3. 若有提供雲端 API Key 且尚未由前端完成（支援 OpenAI ChatGPT `sk-...` 或 Google Gemini `AIza...`）
+    if not ai_result and effective_api_key and not preset_id:
         try:
-            ai_result = await call_gemini_vlm(
-                masked_image_url,
-                effective_api_key,
-                ocr_hint=extracted_ocr_text
-            )
-            if ai_result:
-                used_mode = "gemini_vlm_plus_ocr"
+            if effective_api_key.startswith("sk-"):
+                ai_result = await call_openai_vlm(
+                    masked_image_url,
+                    effective_api_key,
+                    ocr_hint=extracted_ocr_text
+                )
+                if ai_result:
+                    used_mode = "openai_chatgpt_vlm"
+            else:
+                ai_result = await call_gemini_vlm(
+                    masked_image_url,
+                    effective_api_key,
+                    ocr_hint=extracted_ocr_text
+                )
+                if ai_result:
+                    used_mode = "gemini_vlm_plus_ocr"
         except Exception:
             ai_result = None
 
-    # 3. 若未設定雲端 API Key，根據是否為內建範例或真實上傳照片處理：
+    # 4. 若未設定雲端 API Key 或雲端 API 額度不足，根據是否為內建範例或真實上傳照片處理：
     if not ai_result:
         if preset_id and preset_id in SAMPLE_DOCUMENTS:
             ai_result = SAMPLE_DOCUMENTS[preset_id].copy()
         elif extracted_ocr_text and len(extracted_ocr_text.strip()) >= 8:
-            # 使用真實 OCR 文字進行智慧結構化導讀拆解！
             ai_result = parse_ocr_text_to_structured_guide(
                 ocr_text=extracted_ocr_text,
                 filename=filename
             )
         else:
-            # 若圖片完全無文字或極度模糊，依檔名或提供通用銀行通知導讀
             ai_result = parse_ocr_text_to_structured_guide(
                 ocr_text=custom_text_hint or "",
                 filename=filename
             )
 
     raw_text = custom_text_hint.strip() if custom_text_hint else (
-        extracted_ocr_text if extracted_ocr_text else ai_result.get("raw_ocr_text", "")
+        (ai_result.get("raw_ocr_text") or extracted_ocr_text)
+        if used_mode in ("gemini_vlm_plus_ocr", "openai_chatgpt_vlm")
+        else (extracted_ocr_text if extracted_ocr_text else ai_result.get("raw_ocr_text", ""))
     )
     masked_text, masked_pii_list = mask_sensitive_text(raw_text)
 
@@ -183,14 +271,20 @@ async def analyze_financial_document(
         "five_questions": ai_result.get("five_questions", {}),
         "action_steps": ai_result.get("action_steps", []),
         "checklist": ai_result.get("checklist", []),
-        "highlights": ai_result.get("highlights", [
-            {"x": 0.08, "y": 0.25, "w": 0.82, "h": 0.08, "label": "辦理期限位置", "type": "deadline"},
-            {"x": 0.45, "y": 0.75, "w": 0.45, "h": 0.14, "label": "重要資訊／簽章位置", "type": "signature"}
-        ]),
+        "highlights": (
+            ai_result.get("highlights")
+            if preset_id
+            else build_smart_highlights(
+                text=raw_text,
+                deadline=ai_result.get("deadline", ""),
+                doc_title=ai_result.get("doc_title", ""),
+                ai_highlights=ai_result.get("highlights")
+            )
+        ),
         "scam_analysis": scam_analysis,
         "tts": {
             "mandarin": ai_result.get("tts_mandarin", ai_result.get("summary_one_line", "")),
             "taiwanese": ai_result.get("tts_taiwanese", ai_result.get("summary_one_line", ""))
         },
-        "source_verification_note": "資料來源：左側照片（經真實 OCR 擷取）；重要金額與日期已標示位置供核對，重要決定請再向銀行官方確認。"
+        "source_verification_note": "資料來源：左側照片（經真實 OCR／VLM 擷取）；重要金額與日期已標示位置供核對，重要決定請再向銀行官方確認。"
     }

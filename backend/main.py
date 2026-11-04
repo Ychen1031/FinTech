@@ -22,6 +22,7 @@ from ai_analyzer import analyze_financial_document
 from scam_detector import analyze_scam_risk
 from family_guardian import guardian_store
 from history_store import history_store
+from database import get_db_summary_stats
 
 app = FastAPI(
     title="銀齡金融翻譯官 API",
@@ -77,6 +78,19 @@ class AddGuardianRequest(BaseModel):
     relation: str
     phone: str
     auto_notify_scam: bool = True
+
+
+class UpdateHistoryRecordRequest(BaseModel):
+    doc_title: Optional[str] = None
+    doc_category: Optional[str] = None
+    issuer: Optional[str] = None
+    deadline: Optional[str] = None
+    summary_one_line: Optional[str] = None
+    next_step_short: Optional[str] = None
+    raw_ocr_text: Optional[str] = None
+    five_questions: Optional[dict] = None
+    reparse_from_ocr: Optional[bool] = False
+
 
 
 @app.get("/api/health")
@@ -189,7 +203,10 @@ async def analyze_sample_endpoint(req: SampleAnalyzeRequest):
 async def analyze_upload_endpoint(
     file: UploadFile = File(...),
     custom_text_hint: Optional[str] = Form(""),
-    api_key: Optional[str] = Form(None)
+    api_key: Optional[str] = Form(None),
+    client_vlm_json: Optional[str] = Form(None),
+    client_vlm_mode: Optional[str] = Form(""),
+    vlm_warning: Optional[str] = Form(None)
 ):
     image_bytes = await file.read()
     if not image_bytes:
@@ -200,6 +217,16 @@ async def analyze_upload_endpoint(
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"無法解析影像格式，請確認上傳的是照片檔 ({str(e)})")
 
+    if vlm_warning:
+        preprocess_res.setdefault("warnings", []).append(vlm_warning)
+
+    parsed_client_vlm = None
+    if client_vlm_json:
+        try:
+            parsed_client_vlm = json.loads(client_vlm_json)
+        except Exception:
+            parsed_client_vlm = None
+
     enhanced_bytes = preprocess_res.pop("enhanced_image_bytes", image_bytes)
 
     analysis_res = await analyze_financial_document(
@@ -208,7 +235,9 @@ async def analyze_upload_endpoint(
         filename=file.filename or "uploaded_document.jpg",
         preset_id="",
         custom_text_hint=custom_text_hint or "",
-        api_key=api_key
+        api_key=api_key,
+        client_vlm_result=parsed_client_vlm,
+        client_vlm_mode=client_vlm_mode or ""
     )
 
     USAGE_METRICS["total_scans"] += 1
@@ -260,8 +289,14 @@ async def get_history_list():
         "upload_count": upload_count,
         "scam_count": scam_count,
         "normal_count": len(records) - scam_count,
+        "db_stats": get_db_summary_stats(),
         "records": records
     }
+
+
+@app.get("/api/db/stats")
+async def get_database_stats():
+    return get_db_summary_stats()
 
 
 @app.get("/api/history/export/csv")
@@ -292,6 +327,15 @@ async def export_history_json():
             "Content-Disposition": "attachment; filename=recognition_history.json"
         }
     )
+
+
+@app.put("/api/history/{record_id}")
+async def update_history_record(record_id: str, req: UpdateHistoryRecordRequest):
+    updates = req.model_dump(exclude_none=True)
+    updated = history_store.update_record(record_id, updates)
+    if not updated:
+        raise HTTPException(status_code=404, detail="找不到該筆紀錄")
+    return {"status": "ok", "record": updated}
 
 
 @app.delete("/api/history/{record_id}")

@@ -24,12 +24,14 @@ import {
   RotateCcw,
   MessageSquareHeart,
   FolderKanban,
-  Clock
+  Clock,
+  Edit3
 } from 'lucide-react';
 import CameraModal from './components/CameraModal';
 import FamilyGuardianModal from './components/FamilyGuardianModal';
 import ScamQuickCheckerModal from './components/ScamQuickCheckerModal';
 import HistoryVaultView from './components/HistoryVaultModal';
+import EditRecordModal from './components/EditRecordModal';
 
 const API_BASE = 'http://127.0.0.1:8001';
 
@@ -57,6 +59,9 @@ export default function App() {
   const [uploadingFilename, setUploadingFilename] = useState('');
   const [uploadError, setUploadError] = useState('');
   const [loadingStepIndex, setLoadingStepIndex] = useState(0);
+  const [scanSessionKey, setScanSessionKey] = useState(1);
+  const [scanElapsedSec, setScanElapsedSec] = useState(0);
+  const [newFileBanner, setNewFileBanner] = useState('');
 
   // 圖片檢視設定：是否顯示重點與簽名紅框、是否檢視個資遮罩圖層、是否展開 OCR 原文
   const [showHighlights, setShowHighlights] = useState(true);
@@ -85,7 +90,27 @@ export default function App() {
   const [isCameraModalOpen, setIsCameraModalOpen] = useState(false);
   const [isFamilyModalOpen, setIsFamilyModalOpen] = useState(false);
   const [isScamCheckerOpen, setIsScamCheckerOpen] = useState(false);
-  const [apiKey, setApiKey] = useState('');
+  const [editingRecord, setEditingRecord] = useState(null);
+  const [apiKey, setApiKeyState] = useState(() => {
+    try {
+      return (
+        localStorage.getItem('silver_finance_api_key') ||
+        import.meta.env.VITE_GEMINI_API_KEY ||
+        ''
+      );
+    } catch {
+      return import.meta.env.VITE_GEMINI_API_KEY || '';
+    }
+  });
+
+  const setApiKey = (val) => {
+    setApiKeyState(val);
+    try {
+      localStorage.setItem('silver_finance_api_key', val || '');
+    } catch {
+      // ignore storage errors
+    }
+  };
 
   const fileInputRef = useRef(null);
 
@@ -130,6 +155,33 @@ export default function App() {
       }
     } catch (err) {
       console.error('Failed to load history:', err);
+    }
+  };
+
+  // 更新或重新解析單筆辨識紀錄（同步寫入 SQLite）
+  const handleUpdateHistoryRecord = async (recordId, updates) => {
+    try {
+      const res = await fetch(`${API_BASE}/api/history/${recordId}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(updates)
+      });
+      if (res.ok) {
+        const data = await res.json();
+        const updatedRec = data.record;
+        if (updatedRec && currentDocResult?.record_id === recordId) {
+          setCurrentDocResult({
+            record_id: updatedRec.record_id,
+            document_id: updatedRec.document_id,
+            original_image_url: updatedRec.original_image_url,
+            preprocessing: updatedRec.preprocessing,
+            analysis: updatedRec.analysis
+          });
+        }
+        await fetchHistory();
+      }
+    } catch (err) {
+      console.error('Failed to update history record:', err);
     }
   };
 
@@ -220,7 +272,12 @@ export default function App() {
   // 啟動步驟 02 辨識動畫並切換至步驟 03
   const runStep2Transition = (resultData, targetTab = 'guide') => {
     stopSpeaking();
+    const docName = resultData?.analysis?.doc_title || '金融範例文件';
     setCurrentDocResult(resultData);
+    setUploadingFilename(`${docName}.jpg`);
+    setScanSessionKey((k) => k + 1);
+    setScanElapsedSec(0);
+    setNewFileBanner(`🎉 已切換至文件：「${docName}」`);
     setCheckedItems({});
     setChecklistConfirmed(false);
     setShowScamDetailGuide(false);
@@ -233,6 +290,7 @@ export default function App() {
     setTimeout(() => setLoadingStepIndex(2), 450);
     setTimeout(() => setLoadingStepIndex(3), 900);
     setTimeout(() => {
+      setScanSessionKey((k) => k + 1);
       setCurrentStep(3);
       fetchFamilyDashboard();
       fetchHistory();
@@ -276,24 +334,226 @@ export default function App() {
     }
   };
 
+  // 將檔案轉為 Base64 Data URL 供瀏覽器端直連雲端 VLM 使用
+  const fileToDataUrl = (fileObj) =>
+    new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result);
+      reader.onerror = (err) => reject(err);
+      reader.readAsDataURL(fileObj);
+    });
+
+  // 瀏覽器端直接呼叫 OpenAI GPT-4o Vision 或 Google Gemini 2.5 Flash（避免本地後端沙盒阻擋外網連線，並回報額度狀態）
+  const callCloudVlmFromBrowser = async (fileObj, rawKey) => {
+    const cleanKey = (rawKey || '').trim();
+    if (!cleanKey) return { vlmJson: null, mode: '', warning: '' };
+
+    const promptText = `你是一位專為台灣高齡長輩服務的「銀齡金融翻譯官」。
+請閱讀這張金融文件或通知單影像，並以溫暖、清晰、大白話的台灣繁體中文回答長輩最關心的問題。
+同時請嚴格檢查是否有詐騙特徵（例如：要求匯入驗證金至私人帳戶、限時30分鐘內匯款、要求切勿向銀行人員詢問、要求加私人LINE、索取密碼或保證高報酬）。
+請務必輸出純 JSON 格式（不要加上 markdown 程式碼區塊符號），結構如下：
+{
+  "doc_title": "文件名稱（例如：客戶資料確認函、輕鬆還款方案通知函）",
+  "doc_category": "銀行通知 | 保險通知 | 信用卡帳單 | 繳費單 | 可疑通知",
+  "issuer": "發件機構名稱",
+  "is_scam": false,
+  "summary_one_line": "一句話白話說明這張通知在說什麼",
+  "next_step_short": "一句話告訴長輩下一步怎麼做",
+  "deadline": "辦理期限",
+  "raw_ocr_text": "從圖片擷取出的主要文字內容",
+  "five_questions": {
+    "what_is_it": "1. 這張單子是什麼？",
+    "need_action_and_deadline": "2. 要不要處理？期限到哪天？",
+    "where_and_what_to_bring": "3. 要去哪裡、帶什麼？",
+    "where_to_sign": "4. 哪裡要簽名？",
+    "important_notes": "5. 有什麼要注意？"
+  },
+  "action_steps": [
+    {"step_num": 1, "title": "步驟標題", "detail": "步驟白話說明", "source_note": "對應文件位置說明"}
+  ],
+  "checklist": [
+    {"id": "chk_1", "label": "應備資料名稱", "hint": "貼心提醒", "required": true}
+  ],
+  "highlights": [
+    {"x": 0.08, "y": 0.40, "w": 0.84, "h": 0.13, "label": "重點期限：（填入圖片上實際日期或辦理期限文字摘要）", "type": "deadline"},
+    {"x": 0.05, "y": 0.65, "w": 0.68, "h": 0.14, "label": "應備資料／辦理位置：（填入圖片上實際應備證件、勾選項目或簽名位置文字摘要）", "type": "signature"}
+  ],
+  "suspicious_demands": [],
+  "tts_mandarin": "溫馨慢速的國語口語朗讀稿（約 80~120 字）",
+  "tts_taiwanese": "親切道地的台語口語漢字朗讀稿（約 80~120 字，開頭可稱呼阿公阿嬤平安）"
+}
+請注意：highlights 中的 x, y, w, h 為 0.0~1.0 的圖片相對座標（左上角為 0,0），請精準框出圖片中「辦理期限／重要日期段落」與「應備資料／簽章／聯絡方式段落」的真實位置與對應說明文字！`;
+
+    try {
+      const dataUrl = await fileToDataUrl(fileObj);
+      const base64Data = dataUrl.includes(',') ? dataUrl.split(',')[1] : dataUrl;
+      const mimeType = fileObj.type || 'image/jpeg';
+
+      if (cleanKey.startsWith('sk-')) {
+        const resp = await fetch('https://api.openai.com/v1/chat/completions', {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${cleanKey}`,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            model: 'gpt-4o',
+            temperature: 0.2,
+            response_format: { type: 'json_object' },
+            messages: [
+              {
+                role: 'user',
+                content: [
+                  { type: 'text', text: promptText },
+                  { type: 'image_url', image_url: { url: dataUrl } }
+                ]
+              }
+            ]
+          })
+        });
+
+        if (!resp.ok) {
+          const errJson = await resp.json().catch(() => ({}));
+          const errCode = errJson?.error?.code || '';
+          const errMsg = errJson?.error?.message || `HTTP ${resp.status}`;
+          if (resp.status === 429 || errCode === 'insufficient_quota') {
+            return {
+              vlmJson: null,
+              mode: '',
+              warning:
+                'OpenAI API 回報額度不足 (insufficient_quota)：新申請的 OpenAI API Key 需先至 platform.openai.com → Settings → Billing 儲值 API 點數（與 ChatGPT Plus 訂閱分開計費），系統已自動切換為「本地強化版繁中金融 OCR 引擎」完成解析。'
+            };
+          }
+          return {
+            vlmJson: null,
+            mode: '',
+            warning: `OpenAI API 呼叫未通過 (${errCode || resp.status}: ${errMsg.slice(0, 80)})，已自動切換為本地繁中金融 OCR 引擎完成解析。`
+          };
+        }
+
+        const data = await resp.json();
+        const content = data?.choices?.[0]?.message?.content?.trim() || '';
+        if (content) {
+          return { vlmJson: content, mode: 'openai_chatgpt_vlm', warning: '' };
+        }
+      } else {
+        const geminiPayload = JSON.stringify({
+          contents: [
+            {
+              parts: [
+                { text: promptText },
+                { inline_data: { mime_type: mimeType, data: base64Data } }
+              ]
+            }
+          ],
+          generationConfig: {
+            temperature: 0.2,
+            responseMimeType: 'application/json'
+          }
+        });
+
+        const fetchWithTimeout = async (url, timeoutMs = 25000) => {
+          const controller = new AbortController();
+          const timer = setTimeout(() => controller.abort(), timeoutMs);
+          try {
+            return await fetch(url, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: geminiPayload,
+              signal: controller.signal
+            });
+          } finally {
+            clearTimeout(timer);
+          }
+        };
+
+        const urlsToTry = [
+          `https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key=${encodeURIComponent(cleanKey)}`,
+          `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.0-flash:generateContent?key=${encodeURIComponent(cleanKey)}`,
+          `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite-preview:generateContent?key=${encodeURIComponent(cleanKey)}`
+        ];
+
+        const results = await Promise.all(
+          urlsToTry.map(async (url) => {
+            try {
+              const resp = await fetchWithTimeout(url, 25000);
+              if (resp.ok) {
+                const data = await resp.json();
+                let content = data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || '';
+                if (content.startsWith('```')) {
+                  content = content.replace(/^```(?:json)?/i, '').replace(/```$/, '').trim();
+                }
+                if (content) return { ok: true, content };
+              }
+              const errJson = await resp.json().catch(() => ({}));
+              return { ok: false, err: errJson?.error?.message || `HTTP ${resp.status}` };
+            } catch (e) {
+              return { ok: false, err: e.name === 'AbortError' ? '連線逾時 (25秒)' : e.message };
+            }
+          })
+        );
+
+        const win = results.find((r) => r.ok && r.content);
+        if (win) {
+          return { vlmJson: win.content, mode: 'gemini_vlm_plus_ocr', warning: '' };
+        }
+
+        const lastErrMsg =
+          results[0]?.err || results.find((r) => r.err)?.err || '無法連線';
+        return {
+          vlmJson: null,
+          mode: '',
+          warning: `Google Gemini API 呼叫未通過 (${lastErrMsg.slice(0, 120)})，已自動切換為本地繁中金融 OCR 引擎完成解析。`
+        };
+      }
+    } catch (e) {
+      return {
+        vlmJson: null,
+        mode: '',
+        warning: `雲端 API 連線異常 (${e.message || 'Network Error'})，已自動切換為本地繁中金融 OCR 引擎完成解析。`
+      };
+    }
+    return { vlmJson: null, mode: '', warning: '' };
+  };
+
   // 處理實際檔案上傳（支援任意 JPG / PNG / WEBP 網路範例圖或手機照片）
   const handleFileUpload = async (file) => {
     if (!file) return;
     stopSpeaking();
     setUploadError('');
 
+    const fname = file.name || '上傳的文件照片.jpg';
     const localUrl = URL.createObjectURL(file);
+
+    // 立即清空上一張圖檔的辨識結果，確保畫面切換為最新上傳的預覽圖並觸發轉場動畫
+    setCurrentDocResult(null);
+    setShowMaskedImage(false);
     setUploadingPreviewUrl(localUrl);
-    setUploadingFilename(file.name || '上傳的文件照片.jpg');
+    setUploadingFilename(fname);
+    setScanSessionKey((k) => k + 1);
+    setScanElapsedSec(0);
+    setNewFileBanner('');
     setCurrentStep(2);
     setLoadingStepIndex(1);
 
-    const progressTimer = setTimeout(() => setLoadingStepIndex(2), 600);
+    const progressTimer = setTimeout(() => setLoadingStepIndex(2), 650);
+    const startTs = Date.now();
+    const elapsedInterval = setInterval(() => {
+      setScanElapsedSec(Math.floor((Date.now() - startTs) / 1000));
+    }, 1000);
 
     const formData = new FormData();
     formData.append('file', file);
     if (apiKey) {
       formData.append('api_key', apiKey);
+      const { vlmJson, mode, warning } = await callCloudVlmFromBrowser(file, apiKey);
+      if (vlmJson) {
+        formData.append('client_vlm_json', vlmJson);
+        formData.append('client_vlm_mode', mode);
+      }
+      if (warning) {
+        formData.append('vlm_warning', warning);
+      }
     }
 
     try {
@@ -302,6 +562,7 @@ export default function App() {
         body: formData
       });
       clearTimeout(progressTimer);
+      clearInterval(elapsedInterval);
 
       if (!res.ok) {
         const errBody = await res.json().catch(() => ({}));
@@ -316,14 +577,17 @@ export default function App() {
       setShowScamDetailGuide(false);
       setShareSuccessBanner('');
       setActiveTab('guide');
+      setNewFileBanner(`🎉 已成功切換並完成新圖檔辨識：「${fname}」`);
 
       setTimeout(() => {
+        setScanSessionKey((k) => k + 1);
         setCurrentStep(3);
         fetchFamilyDashboard();
         fetchHistory();
       }, 650);
     } catch (err) {
       clearTimeout(progressTimer);
+      clearInterval(elapsedInterval);
       console.error('Upload analyze failed:', err);
       setUploadError(`照片上傳或辨識時發生錯誤：${err.message}`);
       setCurrentStep(1);
@@ -882,38 +1146,65 @@ export default function App() {
               STEP 02: 畫面 2 辨識內容
           ========================================================= */}
           {currentStep === 2 && (
-            <div className="space-y-6">
-              <div>
-                <p className="text-sm font-medium text-slate-500 mb-2">我的文件 / 新增文件</p>
-                <h1 className="text-3xl md:text-4xl font-extrabold text-slate-900">
-                  正在整理您的文件
-                </h1>
+            <div key={`step2-${scanSessionKey}`} className="space-y-6 animate-step-enter">
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div>
+                  <p className="text-sm font-medium text-slate-500 mb-2">我的文件 / 新增文件</p>
+                  <h1 className="text-3xl md:text-4xl font-extrabold text-slate-900">
+                    正在整理您的新文件
+                  </h1>
+                </div>
+                <div className="flex items-center gap-2 rounded-2xl bg-[#0f5c5c] px-4 py-2.5 text-sm font-bold text-white shadow-sm">
+                  <span className="inline-block h-2.5 w-2.5 rounded-full bg-amber-300 animate-ping" />
+                  <span>🆕 新圖檔載入掃描中：{uploadingFilename || '範例文件'}</span>
+                  {scanElapsedSec > 0 && (
+                    <span className="ml-1 rounded-lg bg-white/15 px-2.5 py-0.5 text-xs font-mono">
+                      {scanElapsedSec} 秒
+                    </span>
+                  )}
+                </div>
               </div>
 
               <div className="grid grid-cols-1 gap-8 lg:grid-cols-12 items-start">
-                <div className="lg:col-span-6 relative overflow-hidden rounded-3xl bg-white p-4 shadow-sm border border-slate-200">
-                  <div className="relative overflow-hidden rounded-2xl">
+                <div className="lg:col-span-6 relative overflow-hidden rounded-3xl bg-white p-4 shadow-md border-2 border-[#0f5c5c]/30">
+                  <div className="mb-2.5 flex items-center justify-between px-1">
+                    <span className="inline-flex items-center gap-1.5 rounded-lg bg-teal-50 px-3 py-1 text-xs font-extrabold text-[#0f5c5c] border border-teal-200">
+                      📸 已切換為最新上傳圖檔預覽
+                    </span>
+                    {uploadingFilename && (
+                      <span className="text-xs font-bold text-slate-500 truncate max-w-[220px]">
+                        {uploadingFilename}
+                      </span>
+                    )}
+                  </div>
+                  <div className="relative overflow-hidden rounded-2xl bg-slate-900/5">
                     <img
+                      key={displayImageUrl}
                       src={displayImageUrl}
                       alt="正在辨識的文件"
-                      className="w-full max-h-[540px] object-contain mx-auto"
+                      className="w-full max-h-[540px] object-contain mx-auto animate-image-reveal"
                     />
-                    <div className="pointer-events-none absolute left-0 right-0 h-1 bg-gradient-to-r from-transparent via-[#0f5c5c] to-transparent shadow-[0_0_16px_#0f5c5c] animate-scanline" />
+                    <div className="pointer-events-none absolute left-0 right-0 h-1.5 bg-gradient-to-r from-transparent via-amber-400 to-transparent shadow-[0_0_20px_#0f5c5c] animate-scanline" />
                   </div>
                   {uploadingFilename && (
-                    <p className="mt-2 text-center text-xs text-slate-500">
-                      正在辨識檔案：{uploadingFilename}
+                    <p className="mt-2.5 text-center text-xs font-bold text-[#0f5c5c]">
+                      🔍 AI 視覺模型正在逐行掃描「{uploadingFilename}」...
                     </p>
                   )}
                 </div>
 
                 <div className="lg:col-span-6 rounded-3xl bg-white p-8 md:p-10 shadow-sm border border-slate-200 space-y-6">
-                  <h2 className="text-2xl font-extrabold text-slate-900">文件辨識進度</h2>
+                  <div className="flex items-center justify-between">
+                    <h2 className="text-2xl font-extrabold text-slate-900">新圖檔辨識進度</h2>
+                    <span className="rounded-full bg-teal-50 px-3 py-1 text-xs font-extrabold text-[#0f5c5c]">
+                      步驟 {loadingStepIndex} / 3
+                    </span>
+                  </div>
 
                   <div className="space-y-5 text-lg">
                     <div className="flex items-center gap-3 font-bold text-[#0f5c5c]">
                       <CheckCircle2 className="h-6 w-6 shrink-0" />
-                      <span>✓ 已載入提供的照片（完成邊緣偵測與光線校正）</span>
+                      <span>✓ 已切換載入新照片（完成邊緣偵測、去陰影與細字筆畫增強）</span>
                     </div>
 
                     <div
@@ -922,7 +1213,11 @@ export default function App() {
                       }`}
                     >
                       <CheckCircle2 className="h-6 w-6 shrink-0" />
-                      <span>辨識文件內容（繁體中文 OCR 擷取文字與個資遮罩）</span>
+                      <span>
+                        {apiKey
+                          ? '✨ 雲端 AI 視覺模型看圖解析中（同時擷取全文、重點座標與防詐審查）'
+                          : '⚙️ 本地多通道繁中金融 OCR 解析中（搭配個資不落地自動遮罩）'}
+                      </span>
                     </div>
 
                     <div
@@ -931,7 +1226,7 @@ export default function App() {
                       }`}
                     >
                       <CheckCircle2 className="h-6 w-6 shrink-0" />
-                      <span>整理日期、用途與辦理資訊（並自動存入辨識結果庫）</span>
+                      <span>生成固定五題白話導讀並寫入 SQLite 結構化資料庫 (`silver_finance.db`)</span>
                     </div>
                   </div>
 
@@ -969,7 +1264,24 @@ export default function App() {
               STEP 03: 畫面 3 / 4 / 5 / 6 導讀與行動
           ========================================================= */}
           {currentStep === 3 && analysis && (
-            <div className="space-y-6">
+            <div key={`step3-${scanSessionKey}`} className="space-y-6 animate-step-enter">
+              {/* 新圖檔辨識完成轉場提示橫幅 */}
+              {newFileBanner && (
+                <div className="rounded-2xl bg-[#0f5c5c] text-white px-5 py-3.5 shadow-md flex flex-wrap items-center justify-between gap-3">
+                  <div className="flex items-center gap-2.5 font-extrabold text-base">
+                    <CheckCircle2 className="h-5 w-5 text-amber-300 shrink-0" />
+                    <span>{newFileBanner}</span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setNewFileBanner('')}
+                    className="rounded-lg bg-white/15 px-3 py-1 text-xs font-bold text-white hover:bg-white/25"
+                  >
+                    知道了
+                  </button>
+                </div>
+              )}
+
               {/* Top Breadcrumb & Title */}
               <div className="flex flex-wrap items-center justify-between gap-4">
                 <div>
@@ -995,6 +1307,16 @@ export default function App() {
                 </div>
 
                 <div className="flex flex-wrap items-center gap-2">
+                  {currentDocResult?.record_id && (
+                    <button
+                      type="button"
+                      onClick={() => setEditingRecord(currentDocResult)}
+                      className="flex items-center gap-1.5 rounded-xl border border-amber-300 bg-amber-50 px-4 py-2.5 text-sm font-bold text-amber-950 hover:bg-amber-100 transition"
+                    >
+                      <Edit3 className="h-4 w-4 text-amber-700" />
+                      修正辨識結果
+                    </button>
+                  )}
                   <button
                     type="button"
                     onClick={() => {
@@ -1101,9 +1423,10 @@ export default function App() {
 
                     <div className="relative mx-auto overflow-hidden rounded-2xl border border-slate-200 bg-slate-100">
                       <img
+                        key={displayImageUrl}
                         src={displayImageUrl}
                         alt={analysis.doc_title}
-                        className="w-full h-auto block"
+                        className="w-full h-auto block animate-image-reveal"
                       />
 
                       {showHighlights &&
@@ -1364,8 +1687,12 @@ export default function App() {
                                 長輩最關心的五件事（固定五題格式）：
                               </h3>
                               <span className="text-xs font-semibold text-slate-500">
-                                {analysis.engine_mode === 'real_tesseract_ocr_engine'
-                                  ? '✓ 已由照片真實 OCR 辨識產生'
+                                {analysis.engine_mode === 'openai_chatgpt_vlm'
+                                  ? '🤖 OpenAI ChatGPT (GPT-4o Vision) 辨識'
+                                  : analysis.engine_mode === 'gemini_vlm_plus_ocr'
+                                  ? '✨ Gemini 2.5 VLM 多模態視覺辨識'
+                                  : analysis.engine_mode === 'real_tesseract_ocr_engine'
+                                  ? '✓ 多通道 AI OCR ＋ 金融專有名詞糾錯引擎'
                                   : 'AI 結構化導讀'}
                               </span>
                             </div>
@@ -1657,6 +1984,7 @@ export default function App() {
               historyData={historyData}
               apiBase={API_BASE}
               onOpenRecordInStep3={handleOpenRecordInStep3}
+              onEditRecord={(rec) => setEditingRecord(rec)}
               onDeleteRecord={handleDeleteHistoryRecord}
               onClearAll={handleClearAllHistory}
               onUploadNewClick={() => {
@@ -1672,7 +2000,7 @@ export default function App() {
               銀齡金融翻譯官｜高齡者金融文件 AI 導讀與行動指引服務
             </span>
             <span className="font-medium text-[#0f5c5c]">
-              ● 後端 Python FastAPI 服務已連線（內建真實 Tesseract 繁中 OCR、辨識結果收集庫與防詐比對）
+              ● 後端 FastAPI + SQLite 已連線（內建多通道金融詞典 OCR、Gemini 2.5 VLM、ChatGPT GPT-4o Vision 與 165 防詐比對）
             </span>
           </footer>
         </main>
@@ -1699,6 +2027,13 @@ export default function App() {
         onClose={() => setIsScamCheckerOpen(false)}
         apiKey={apiKey}
         setApiKey={setApiKey}
+      />
+
+      <EditRecordModal
+        isOpen={!!editingRecord}
+        onClose={() => setEditingRecord(null)}
+        recordData={editingRecord}
+        onSaveRecord={handleUpdateHistoryRecord}
       />
     </div>
   );

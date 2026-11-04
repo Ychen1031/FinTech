@@ -6,6 +6,9 @@ __pycache__/
 *.py[cod]
 *$py.class
 .env
+.env.*
+frontend/.env
+frontend/.env.*
 
 # Node / React / Vite
 frontend/node_modules/
