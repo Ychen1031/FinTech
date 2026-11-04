@@ -1,13 +1,15 @@
 """
 銀齡金融翻譯官：高齡者金融文件 AI 導讀與行動指引服務
 FastAPI 後端主程式 (main.py)
-整合四大核心模組：
+整合四大核心模組＋辨識結果收集庫：
 - 模組一：拍照與影像前處理（邊緣偵測、光線／手震檢查、個資自動遮罩）
 - 模組二：AI 解析與白話導讀（真實 Tesseract OCR + VLM、LLM 固定五題格式、辦理步驟、應備資料清單）
 - 模組三：防詐警示（詐騙關鍵字與異常要求規則比對、165 與官方查證提醒）
 - 模組四：語音朗讀與家屬守護（國語／台語口語講稿、高風險自動推播、一鍵分享給家人）
+- 辨識結果收集庫：自動儲存每次辨識結果，支援歷史調閱、篩選與 CSV/JSON 報表匯出
 """
 
+import json
 from typing import Optional, List
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -19,11 +21,12 @@ from image_processor import preprocess_and_check_image
 from ai_analyzer import analyze_financial_document
 from scam_detector import analyze_scam_risk
 from family_guardian import guardian_store
+from history_store import history_store
 
 app = FastAPI(
     title="銀齡金融翻譯官 API",
     description="高齡者金融文件 AI 導讀與行動指引服務後端系統",
-    version="1.1.0"
+    version="1.2.0"
 )
 
 app.add_middleware(
@@ -85,7 +88,8 @@ async def health_check():
             "模組一：拍照與影像前處理（含個資遮罩）",
             "模組二：AI 解析與白話導讀（真實 Tesseract 繁中 OCR ＋ 固定五題格式）",
             "模組三：防詐警示（165 關鍵字與規則比對）",
-            "模組四：語音朗讀與家屬守護網"
+            "模組四：語音朗讀與家屬守護網",
+            "辨識紀錄收集庫：自動保存與 CSV/JSON 匯出"
         ]
     }
 
@@ -147,6 +151,16 @@ async def analyze_sample_endpoint(req: SampleAnalyzeRequest):
 
     USAGE_METRICS["total_scans"] += 1
 
+    # 自動收集儲存至辨識紀錄庫
+    saved_record = history_store.add_record(
+        source_type="sample",
+        filename=f"{sample['doc_title']}.jpg",
+        document_id=sample["id"],
+        original_image_url=sample["image_data_url"],
+        preprocessing=preprocess_res,
+        analysis=analysis_res
+    )
+
     auto_notif = None
     if analysis_res["is_scam"]:
         USAGE_METRICS["scam_blocked"] += 1
@@ -162,6 +176,7 @@ async def analyze_sample_endpoint(req: SampleAnalyzeRequest):
         )
 
     return {
+        "record_id": saved_record["record_id"],
         "document_id": sample["id"],
         "original_image_url": sample["image_data_url"],
         "preprocessing": preprocess_res,
@@ -176,13 +191,6 @@ async def analyze_upload_endpoint(
     custom_text_hint: Optional[str] = Form(""),
     api_key: Optional[str] = Form(None)
 ):
-    """
-    處理長輩實際拍照或上傳的任意金融文件照片（JPG/PNG/WEBP 等）：
-    1. 影像品質檢測（亮度、清晰度、歪斜校正）與個資自動遮罩
-    2. 執行真實繁體中文 Tesseract OCR (chi_tra+eng) 擷取單據文字
-    3. 傳送至 AI 模型或本地金融文件結構化導讀引擎產出白話五題問答
-    4. 防詐規則審查與家屬連動
-    """
     image_bytes = await file.read()
     if not image_bytes:
         raise HTTPException(status_code=400, detail="上傳的影像檔案為空")
@@ -205,6 +213,16 @@ async def analyze_upload_endpoint(
 
     USAGE_METRICS["total_scans"] += 1
 
+    # 自動收集儲存至辨識紀錄庫
+    saved_record = history_store.add_record(
+        source_type="upload",
+        filename=file.filename or "uploaded_document.jpg",
+        document_id="custom_upload",
+        original_image_url=preprocess_res["enhanced_image_url"],
+        preprocessing=preprocess_res,
+        analysis=analysis_res
+    )
+
     auto_notif = None
     if analysis_res["is_scam"]:
         USAGE_METRICS["scam_blocked"] += 1
@@ -220,12 +238,74 @@ async def analyze_upload_endpoint(
         )
 
     return {
+        "record_id": saved_record["record_id"],
         "document_id": "custom_upload",
         "original_image_url": preprocess_res["enhanced_image_url"],
         "preprocessing": preprocess_res,
         "analysis": analysis_res,
         "auto_family_notification": auto_notif
     }
+
+
+# =========================================================
+# 辨識結果收集庫 API (/api/history)
+# =========================================================
+@app.get("/api/history")
+async def get_history_list():
+    records = history_store.list_records()
+    upload_count = sum(1 for r in records if r.get("source_type") == "upload")
+    scam_count = sum(1 for r in records if r.get("is_scam"))
+    return {
+        "total": len(records),
+        "upload_count": upload_count,
+        "scam_count": scam_count,
+        "normal_count": len(records) - scam_count,
+        "records": records
+    }
+
+
+@app.get("/api/history/export/csv")
+async def export_history_csv():
+    csv_bytes = history_store.export_csv_bytes()
+    return Response(
+        content=csv_bytes,
+        media_type="text/csv; charset=utf-8",
+        headers={
+            "Content-Disposition": "attachment; filename=recognition_history.csv"
+        }
+    )
+
+
+@app.get("/api/history/export/json")
+async def export_history_json():
+    records = history_store.list_records()
+    # 匯出精簡結構化 JSON（不含大型 Base64 圖檔字串，方便閱讀與整理）
+    clean_records = []
+    for r in records:
+        c = {k: v for k, v in r.items() if k not in ("original_image_url", "preprocessing")}
+        clean_records.append(c)
+    json_bytes = json.dumps(clean_records, ensure_ascii=False, indent=2).encode("utf-8")
+    return Response(
+        content=json_bytes,
+        media_type="application/json; charset=utf-8",
+        headers={
+            "Content-Disposition": "attachment; filename=recognition_history.json"
+        }
+    )
+
+
+@app.delete("/api/history/{record_id}")
+async def delete_history_record(record_id: str):
+    ok = history_store.delete_record(record_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="找不到該筆紀錄")
+    return {"status": "ok"}
+
+
+@app.delete("/api/history")
+async def clear_all_history():
+    history_store.clear_all()
+    return {"status": "ok"}
 
 
 @app.post("/api/scam-check")

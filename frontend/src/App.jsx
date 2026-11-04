@@ -22,16 +22,19 @@ import {
   HelpCircle,
   ArrowRight,
   RotateCcw,
-  MessageSquareHeart
+  MessageSquareHeart,
+  FolderKanban,
+  Clock
 } from 'lucide-react';
 import CameraModal from './components/CameraModal';
 import FamilyGuardianModal from './components/FamilyGuardianModal';
 import ScamQuickCheckerModal from './components/ScamQuickCheckerModal';
+import HistoryVaultView from './components/HistoryVaultModal';
 
 const API_BASE = 'http://127.0.0.1:8001';
 
 export default function App() {
-  // 步驟狀態: 1 = 01 上傳文件, 2 = 02 辨識內容, 3 = 03 導讀與行動
+  // 步驟狀態: 1 = 01 上傳文件, 2 = 02 辨識內容, 3 = 03 導讀與行動, 4 = 04 辨識結果收集庫
   const [currentStep, setCurrentStep] = useState(1);
   // 畫面 3/4/5 分頁狀態: 'guide' (白話導讀) | 'steps' (辦理步驟) | 'checklist' (應備資料)
   const [activeTab, setActiveTab] = useState('guide');
@@ -39,9 +42,17 @@ export default function App() {
   // 大字友善字體縮放: 'normal' | 'large' | 'xlarge'
   const [fontScale, setFontScale] = useState('large');
 
-  // 範例清單與目前解析結果
+  // 範例清單、目前解析結果與歷史收集庫
   const [samples, setSamples] = useState([]);
   const [currentDocResult, setCurrentDocResult] = useState(null);
+  const [historyData, setHistoryData] = useState({
+    total: 0,
+    upload_count: 0,
+    scam_count: 0,
+    normal_count: 0,
+    records: []
+  });
+
   const [uploadingPreviewUrl, setUploadingPreviewUrl] = useState('');
   const [uploadingFilename, setUploadingFilename] = useState('');
   const [uploadError, setUploadError] = useState('');
@@ -78,10 +89,11 @@ export default function App() {
 
   const fileInputRef = useRef(null);
 
-  // 初始載入範例清單與家屬守護看板
+  // 初始載入範例清單、家屬守護看板與已收集的歷史辨識紀錄
   useEffect(() => {
     fetchSamples();
     fetchFamilyDashboard();
+    fetchHistory();
     return () => {
       if (window.speechSynthesis) {
         window.speechSynthesis.cancel();
@@ -107,6 +119,56 @@ export default function App() {
     } catch (err) {
       console.error('Failed to load family dashboard:', err);
     }
+  };
+
+  const fetchHistory = async () => {
+    try {
+      const res = await fetch(`${API_BASE}/api/history`);
+      if (res.ok) {
+        const data = await res.json();
+        setHistoryData(data);
+      }
+    } catch (err) {
+      console.error('Failed to load history:', err);
+    }
+  };
+
+  // 刪除單筆辨識紀錄
+  const handleDeleteHistoryRecord = async (recordId) => {
+    try {
+      await fetch(`${API_BASE}/api/history/${recordId}`, { method: 'DELETE' });
+      fetchHistory();
+    } catch (err) {
+      console.error('Failed to delete history record:', err);
+    }
+  };
+
+  // 清空全部辨識紀錄
+  const handleClearAllHistory = async () => {
+    try {
+      await fetch(`${API_BASE}/api/history`, { method: 'DELETE' });
+      fetchHistory();
+    } catch (err) {
+      console.error('Failed to clear history:', err);
+    }
+  };
+
+  // 從收集庫點選任一筆紀錄，直接載入至步驟 03 完整導讀畫面
+  const handleOpenRecordInStep3 = (rec) => {
+    stopSpeaking();
+    setCurrentDocResult({
+      record_id: rec.record_id,
+      document_id: rec.document_id,
+      original_image_url: rec.original_image_url,
+      preprocessing: rec.preprocessing,
+      analysis: rec.analysis
+    });
+    setCheckedItems({});
+    setChecklistConfirmed(false);
+    setShowScamDetailGuide(false);
+    setShareSuccessBanner('');
+    setActiveTab('guide');
+    setCurrentStep(3);
   };
 
   // 停止語音
@@ -173,6 +235,7 @@ export default function App() {
     setTimeout(() => {
       setCurrentStep(3);
       fetchFamilyDashboard();
+      fetchHistory();
     }, 1350);
   };
 
@@ -203,12 +266,13 @@ export default function App() {
         setActiveTab(targetTab);
         setCurrentStep(3);
         fetchFamilyDashboard();
+        fetchHistory();
       } else {
         runStep2Transition(data, targetTab);
       }
     } catch (err) {
       console.error('Sample analyze failed:', err);
-      setUploadError('無法連線至後端 Python 服務，請確認後端 (Port 8000) 已啟動。');
+      setUploadError('無法連線至後端 Python 服務，請確認後端 (Port 8001) 已啟動。');
     }
   };
 
@@ -218,7 +282,6 @@ export default function App() {
     stopSpeaking();
     setUploadError('');
 
-    // 1. 立即建立本地預覽圖並跳轉至步驟 02，讓使用者立刻看到自己上傳的 JPG！
     const localUrl = URL.createObjectURL(file);
     setUploadingPreviewUrl(localUrl);
     setUploadingFilename(file.name || '上傳的文件照片.jpg');
@@ -257,6 +320,7 @@ export default function App() {
       setTimeout(() => {
         setCurrentStep(3);
         fetchFamilyDashboard();
+        fetchHistory();
       }, 650);
     } catch (err) {
       clearTimeout(progressTimer);
@@ -341,7 +405,6 @@ export default function App() {
     ? preprocessing?.masked_image_url
     : preprocessing?.enhanced_image_url || currentDocResult?.original_image_url || uploadingPreviewUrl;
 
-  // 找出與當前文件對應的最新家屬回覆
   const matchingFamilyNotification = familyDashboard.notifications?.find(
     (n) => analysis && n.doc_title === analysis.doc_title && n.family_reply
   );
@@ -373,6 +436,27 @@ export default function App() {
         </div>
 
         <div className="flex flex-wrap items-center gap-2.5">
+          {/* 辨識結果收集庫按鈕 */}
+          <button
+            type="button"
+            onClick={() => {
+              stopSpeaking();
+              fetchHistory();
+              setCurrentStep(4);
+            }}
+            className={`flex items-center gap-2 rounded-xl px-4 py-2 text-sm font-bold shadow-sm transition ${
+              currentStep === 4
+                ? 'bg-[#0f5c5c] text-white'
+                : 'border border-teal-300 bg-[#e9f2f0] text-[#16383a] hover:bg-teal-100'
+            }`}
+          >
+            <FolderKanban className="h-4 w-4 text-[#0f5c5c]" />
+            <span>辨識結果收集庫</span>
+            <span className="rounded-full bg-[#0f5c5c] px-2 py-0.5 text-xs font-extrabold text-white">
+              {historyData.total || 0}
+            </span>
+          </button>
+
           <button
             type="button"
             onClick={cycleFontScale}
@@ -403,10 +487,6 @@ export default function App() {
               {familyDashboard.notifications?.length || 1}
             </span>
           </button>
-
-          <div className="hidden rounded-xl bg-[#fdf3d7] px-4 py-2 text-sm font-bold text-[#8a6116] lg:block">
-            概念展示・圖片導讀
-          </div>
         </div>
       </header>
 
@@ -460,6 +540,29 @@ export default function App() {
             >
               <span className="text-base font-semibold text-teal-300">03</span>
               <span>導讀與行動</span>
+            </button>
+
+            {/* 新增步驟 04：已收集的辨識結果庫 */}
+            <button
+              type="button"
+              onClick={() => {
+                stopSpeaking();
+                fetchHistory();
+                setCurrentStep(4);
+              }}
+              className={`flex w-full items-center justify-between rounded-2xl px-4 py-4 text-left text-lg font-bold transition ${
+                currentStep === 4
+                  ? 'bg-[#265356] text-white shadow-inner'
+                  : 'text-teal-100/75 hover:bg-white/5'
+              }`}
+            >
+              <div className="flex items-center gap-3.5">
+                <span className="text-base font-semibold text-amber-300">04</span>
+                <span>辨識結果庫</span>
+              </div>
+              <span className="rounded-full bg-teal-900/90 px-2.5 py-0.5 text-xs font-extrabold text-amber-300 border border-teal-600">
+                {historyData.total || 0} 筆
+              </span>
             </button>
           </nav>
 
@@ -598,8 +701,21 @@ export default function App() {
             </div>
           )}
 
+          {/* 隱藏的全域檔案上傳 Input */}
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="image/*,.jpg,.jpeg,.png,.webp"
+            className="hidden"
+            onChange={(e) => {
+              const file = e.target.files?.[0];
+              e.target.value = '';
+              if (file) handleFileUpload(file);
+            }}
+          />
+
           {/* =========================================================
-              STEP 01: 畫面 1 上傳文件（支援直接選取 JPG/PNG、拖曳上傳、相機拍攝）
+              STEP 01: 畫面 1 上傳文件
           ========================================================= */}
           {currentStep === 1 && (
             <div className="space-y-8">
@@ -613,7 +729,7 @@ export default function App() {
                 </p>
               </div>
 
-              {/* 畫面 1 核心大按鈕白色卡片（同時支援拖放 JPG 圖片） */}
+              {/* 畫面 1 核心大按鈕白色卡片 */}
               <div
                 onDragOver={(e) => e.preventDefault()}
                 onDrop={(e) => {
@@ -628,7 +744,6 @@ export default function App() {
                 </div>
 
                 <div className="flex flex-col sm:flex-row items-center gap-4 w-full max-w-xl justify-center">
-                  {/* 直接開啟檔案選擇器讓使用者上傳網路下載的 JPG 圖片最直覺！ */}
                   <button
                     type="button"
                     onClick={() => fileInputRef.current?.click()}
@@ -645,18 +760,6 @@ export default function App() {
                     <Camera className="h-5 w-5" />
                     開啟框線引導相機
                   </button>
-
-                  <input
-                    ref={fileInputRef}
-                    type="file"
-                    accept="image/*,.jpg,.jpeg,.png,.webp"
-                    className="hidden"
-                    onChange={(e) => {
-                      const file = e.target.files?.[0];
-                      e.target.value = '';
-                      if (file) handleFileUpload(file);
-                    }}
-                  />
                 </div>
 
                 <p className="mt-4 text-sm text-slate-400">
@@ -665,8 +768,63 @@ export default function App() {
               </div>
 
               <p className="text-center text-lg font-medium text-slate-600">
-                支援銀行通知、帳單與保險文件（內建真實繁體中文 OCR 文字辨識與個資遮罩）
+                支援銀行通知、帳單與保險文件（辨識完畢將自動收集至「04 辨識結果庫」方便隨時查看）
               </p>
+
+              {/* 最近已收集的辨識紀錄快覽區（若有紀錄直接顯示於首頁下方！） */}
+              {historyData.records?.length > 0 && (
+                <div className="rounded-3xl bg-white p-6 shadow-sm border border-teal-200/80 space-y-4">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <h2 className="text-lg font-extrabold text-[#16383a] flex items-center gap-2">
+                      <FolderKanban className="h-5 w-5 text-[#0f5c5c]" />
+                      最近收集的辨識結果（已存 {historyData.total} 筆）：
+                    </h2>
+                    <button
+                      type="button"
+                      onClick={() => setCurrentStep(4)}
+                      className="flex items-center gap-1 rounded-xl bg-[#e9f2f0] px-4 py-2 text-sm font-bold text-[#0f5c5c] hover:bg-teal-100"
+                    >
+                      查看全部收集紀錄與匯出報表 <ArrowRight className="h-4 w-4" />
+                    </button>
+                  </div>
+
+                  <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
+                    {historyData.records.slice(0, 3).map((rec) => (
+                      <div
+                        key={rec.record_id}
+                        onClick={() => handleOpenRecordInStep3(rec)}
+                        className="group flex cursor-pointer items-center gap-3.5 rounded-2xl border border-slate-200 bg-slate-50/70 p-3.5 hover:border-[#0f5c5c] hover:bg-white transition"
+                      >
+                        <img
+                          src={rec.original_image_url}
+                          alt={rec.doc_title}
+                          className="h-16 w-14 shrink-0 rounded-xl object-cover border border-slate-200 bg-white"
+                        />
+                        <div className="min-w-0 flex-1">
+                          <div className="flex items-center gap-1.5">
+                            <span
+                              className={`rounded px-1.5 py-0.5 text-[11px] font-bold ${
+                                rec.source_type === 'upload'
+                                  ? 'bg-[#0f5c5c] text-white'
+                                  : 'bg-teal-100 text-[#0f5c5c]'
+                              }`}
+                            >
+                              {rec.source_type === 'upload' ? '自訂上傳' : '範例'}
+                            </span>
+                            <span className="truncate text-xs text-slate-400">
+                              {rec.created_at.split(' ')[1]}
+                            </span>
+                          </div>
+                          <p className="mt-1 truncate text-base font-extrabold text-slate-900 group-hover:text-[#0f5c5c]">
+                            {rec.doc_title}
+                          </p>
+                          <p className="truncate text-xs text-slate-600">{rec.summary_one_line}</p>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
 
               {/* 快速體驗範例卡片區 */}
               <div className="pt-4 border-t border-slate-200">
@@ -721,7 +879,7 @@ export default function App() {
           )}
 
           {/* =========================================================
-              STEP 02: 畫面 2 辨識內容 (正在整理您的文件 - 即使還在背景 OCR 也會立即顯示預覽圖！)
+              STEP 02: 畫面 2 辨識內容
           ========================================================= */}
           {currentStep === 2 && (
             <div className="space-y-6">
@@ -733,7 +891,6 @@ export default function App() {
               </div>
 
               <div className="grid grid-cols-1 gap-8 lg:grid-cols-12 items-start">
-                {/* 左側：剛上傳的 JPG 文件照片與掃描特效 */}
                 <div className="lg:col-span-6 relative overflow-hidden rounded-3xl bg-white p-4 shadow-sm border border-slate-200">
                   <div className="relative overflow-hidden rounded-2xl">
                     <img
@@ -750,7 +907,6 @@ export default function App() {
                   )}
                 </div>
 
-                {/* 右側：進度條與步驟說明（完全對應畫面 2） */}
                 <div className="lg:col-span-6 rounded-3xl bg-white p-8 md:p-10 shadow-sm border border-slate-200 space-y-6">
                   <h2 className="text-2xl font-extrabold text-slate-900">文件辨識進度</h2>
 
@@ -775,11 +931,10 @@ export default function App() {
                       }`}
                     >
                       <CheckCircle2 className="h-6 w-6 shrink-0" />
-                      <span>整理日期、用途与辦理資訊（含 165 防詐比對）</span>
+                      <span>整理日期、用途與辦理資訊（並自動存入辨識結果庫）</span>
                     </div>
                   </div>
 
-                  {/* 深青色進度條 */}
                   <div className="h-4 w-full overflow-hidden rounded-full bg-slate-200">
                     <div
                       className="h-full rounded-full bg-[#0f5c5c] transition-all duration-500"
@@ -811,7 +966,7 @@ export default function App() {
           )}
 
           {/* =========================================================
-              STEP 03: 畫面 3 白話導讀 / 畫面 4 辦理步驟 / 畫面 5 應備資料 / 畫面 6 可疑通知警示
+              STEP 03: 畫面 3 / 4 / 5 / 6 導讀與行動
           ========================================================= */}
           {currentStep === 3 && analysis && (
             <div className="space-y-6">
@@ -832,40 +987,34 @@ export default function App() {
                     <span className="rounded-xl bg-teal-100 px-3 py-1 text-xs font-bold text-[#0f5c5c]">
                       發件單位：{analysis.issuer}
                     </span>
+                    <span className="inline-flex items-center gap-1 rounded-xl bg-emerald-100 px-3 py-1 text-xs font-bold text-emerald-800">
+                      <CheckCircle2 className="h-3.5 w-3.5" />
+                      已自動收集至辨識結果庫
+                    </span>
                   </div>
                 </div>
 
                 <div className="flex flex-wrap items-center gap-2">
                   <button
                     type="button"
+                    onClick={() => {
+                      stopSpeaking();
+                      fetchHistory();
+                      setCurrentStep(4);
+                    }}
+                    className="flex items-center gap-1.5 rounded-xl border border-[#0f5c5c] bg-[#e9f2f0] px-4 py-2.5 text-sm font-bold text-[#0f5c5c] hover:bg-teal-100"
+                  >
+                    <FolderKanban className="h-4 w-4" />
+                    查看已收集結果 ({historyData.total || 0})
+                  </button>
+                  <button
+                    type="button"
                     onClick={() => fileInputRef.current?.click()}
                     className="flex items-center gap-1.5 rounded-xl bg-[#0f5c5c] px-4 py-2.5 text-sm font-bold text-white hover:bg-[#0b4646]"
                   >
                     <Upload className="h-4 w-4" />
-                    上傳另一張 JPG 照片
+                    繼續上傳下一張 JPG
                   </button>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      stopSpeaking();
-                      setCurrentStep(1);
-                    }}
-                    className="flex items-center gap-1.5 rounded-xl border border-slate-300 bg-white px-4 py-2.5 text-sm font-bold text-slate-700 hover:bg-slate-50"
-                  >
-                    <RotateCcw className="h-4 w-4" />
-                    返回首頁
-                  </button>
-                  <input
-                    ref={fileInputRef}
-                    type="file"
-                    accept="image/*,.jpg,.jpeg,.png,.webp"
-                    className="hidden"
-                    onChange={(e) => {
-                      const file = e.target.files?.[0];
-                      e.target.value = '';
-                      if (file) handleFileUpload(file);
-                    }}
-                  />
                 </div>
               </div>
 
@@ -913,7 +1062,6 @@ export default function App() {
                 {/* 左側：文件影像與原文位置對照 (佔 5 欄) */}
                 <div className="lg:col-span-5 space-y-3">
                   <div className="overflow-hidden rounded-3xl bg-white p-4 shadow-sm border border-slate-200">
-                    {/* 圖片上方工具列 */}
                     <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
                       <button
                         type="button"
@@ -951,7 +1099,6 @@ export default function App() {
                       </button>
                     </div>
 
-                    {/* 圖片容器 */}
                     <div className="relative mx-auto overflow-hidden rounded-2xl border border-slate-200 bg-slate-100">
                       <img
                         src={displayImageUrl}
@@ -959,7 +1106,6 @@ export default function App() {
                         className="w-full h-auto block"
                       />
 
-                      {/* 動態繪製原文位置與簽名紅框 */}
                       {showHighlights &&
                         (analysis.highlights || []).map((hl, index) => {
                           const isSig = hl.type === 'signature';
@@ -993,7 +1139,6 @@ export default function App() {
                         })}
                     </div>
 
-                    {/* 影像前處理與 OCR 原文展開按鈕 */}
                     <div className="mt-3 rounded-xl bg-slate-50 p-3 text-xs text-slate-600 border border-slate-200/80 space-y-2">
                       <div className="flex flex-wrap items-center justify-between gap-1 font-bold text-[#0f5c5c]">
                         <span>✓ 邊緣自動校正完成</span>
@@ -1024,9 +1169,6 @@ export default function App() {
 
                 {/* 右側：導讀卡片或可疑通知防詐警示卡片 (佔 7 欄) */}
                 <div className="lg:col-span-7">
-                  {/* =======================================================
-                      情境 A：可疑通知警示（畫面 6）
-                  ======================================================= */}
                   {analysis.is_scam && !showScamDetailGuide ? (
                     <div className="rounded-3xl bg-white p-7 md:p-9 shadow-sm border border-rose-200 space-y-6">
                       <div className="rounded-2xl bg-[#fdede4] px-6 py-5 text-[#963b22] border border-rose-200/80">
@@ -1143,9 +1285,6 @@ export default function App() {
                       </div>
                     </div>
                   ) : (
-                    /* =======================================================
-                        情境 B：一般金融文件導讀（畫面 3、4、5）
-                    ======================================================= */
                     <div className="rounded-3xl bg-white p-7 md:p-9 shadow-sm border border-slate-200 space-y-7">
                       {analysis.is_scam && (
                         <div className="flex items-center justify-between rounded-xl bg-rose-100 px-4 py-2.5 text-sm font-bold text-rose-900">
@@ -1160,7 +1299,6 @@ export default function App() {
                         </div>
                       )}
 
-                      {/* 頂部三個膠囊分頁（白話導讀 / 辦理步驟 / 應備資料） */}
                       <div className="grid grid-cols-3 gap-3">
                         <button
                           type="button"
@@ -1197,7 +1335,6 @@ export default function App() {
                         </button>
                       </div>
 
-                      {/* TAB 1: 畫面 3 白話導讀 + 固定五題格式 */}
                       {activeTab === 'guide' && (
                         <div className="space-y-6">
                           <div className="space-y-2">
@@ -1220,7 +1357,6 @@ export default function App() {
                             期限：{analysis.deadline}
                           </p>
 
-                          {/* 固定五題白話問答表 */}
                           <div className="rounded-2xl border border-slate-200 bg-slate-50/70 p-5 space-y-3.5">
                             <div className="flex items-center justify-between">
                               <h3 className="text-base font-extrabold text-[#16383a] flex items-center gap-2">
@@ -1366,7 +1502,6 @@ export default function App() {
                         </div>
                       )}
 
-                      {/* TAB 2: 畫面 4 辦理步驟 */}
                       {activeTab === 'steps' && (
                         <div className="space-y-6">
                           <div className="space-y-6">
@@ -1424,7 +1559,6 @@ export default function App() {
                         </div>
                       )}
 
-                      {/* TAB 3: 畫面 5 應備資料檢查清單 */}
                       {activeTab === 'checklist' && (
                         <div className="space-y-6">
                           <h2 className="text-2xl font-extrabold text-slate-900">
@@ -1515,13 +1649,30 @@ export default function App() {
             </div>
           )}
 
+          {/* =========================================================
+              STEP 04: 辨識結果收集庫（我的文件）
+          ========================================================= */}
+          {currentStep === 4 && (
+            <HistoryVaultView
+              historyData={historyData}
+              apiBase={API_BASE}
+              onOpenRecordInStep3={handleOpenRecordInStep3}
+              onDeleteRecord={handleDeleteHistoryRecord}
+              onClearAll={handleClearAllHistory}
+              onUploadNewClick={() => {
+                setCurrentStep(1);
+                setTimeout(() => fileInputRef.current?.click(), 100);
+              }}
+            />
+          )}
+
           {/* Footer Note */}
           <footer className="mt-10 pt-4 border-t border-slate-200/80 flex flex-wrap items-center justify-between gap-2 text-sm text-slate-500">
             <span>
               銀齡金融翻譯官｜高齡者金融文件 AI 導讀與行動指引服務
             </span>
             <span className="font-medium text-[#0f5c5c]">
-              ● 後端 Python FastAPI 服務已連線（內建真實 Tesseract 繁中 OCR、個資遮罩與防詐比對）
+              ● 後端 Python FastAPI 服務已連線（內建真實 Tesseract 繁中 OCR、辨識結果收集庫與防詐比對）
             </span>
           </footer>
         </main>
