@@ -1,0 +1,41 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html {
+    font-family: "PingFang TC", "Noto Sans TC", "Microsoft JhengHei", sans-serif;
+  }
+}
+
+/* 高齡友善字體縮放模式 */
+.senior-scale-normal {
+  font-size: 16px;
+}
+
+.senior-scale-large {
+  font-size: 18.5px;
+}
+
+.senior-scale-xlarge {
+  font-size: 21px;
+}
+
+@keyframes scanline {
+  0% {
+    top: 6%;
+    opacity: 0.85;
+  }
+  50% {
+    top: 88%;
+    opacity: 1;
+  }
+  100% {
+    top: 6%;
+    opacity: 0.85;
+  }
+}
+
+.animate-scanline {
+  animation: scanline 2.6s ease-in-out infinite;
+}

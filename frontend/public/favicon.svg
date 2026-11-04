@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#146c6c" />
+      <stop offset="100%" stop-color="#0f4c4e" />
+    </linearGradient>
+  </defs>
+  <!-- 圓角深青色方塊底圖（對應計畫書左上角「銀」字 Logo） -->
+  <rect x="6" y="6" width="116" height="116" rx="28" fill="url(#bgGrad)" stroke="#a7f3d0" stroke-width="3" stroke-opacity="0.35" />
+  <!-- 白色粗體「銀」字 -->
+  <text
+    x="64"
+    y="89"
+    font-family="'PingFang TC', 'Noto Sans TC', 'Heiti TC', 'Microsoft JhengHei', sans-serif"
+    font-size="76"
+    font-weight="800"
+    fill="#ffffff"
+    text-anchor="middle"
+  >銀</text>
+</svg>
